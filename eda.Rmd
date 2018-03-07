@@ -1,0 +1,786 @@
+---
+title: "Twitter Analysis"
+author: "Mohin Banker"
+date: "2/16/2018"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+```
+
+## Cleaning Data
+
+First, we read in the data and clean date-times and classify datatypes. Before, I mapped Unicode hex codes to emojis and symbols, but now realize that having these values isn't very useful. Therefore, we remove all unrecognized symbols.
+
+Previously, I was replacing hex codes with their corresponding emojis. Credit to Kate Lyons and Jessica Peterka-Bonetta for developing a free dictionary for translating Unicode to emojis. Unfortunately, the literature on using emojis in sentiment analyses is sparse and unexplored. Emojis were generally used frequently (about 1/8 of tweets had some kind of emoji or symbol), but no single emoji was used with extreme frequency. Further analysis would involve coding obvious emojis to their corresponding sentiments (e.g. laughter, love, or heart emojis coded to positive sentiments).
+
+```{r clean}
+library(tidyverse)
+library(data.table)
+library(Hmisc)
+library(lubridate)
+library(DataCombine)
+library(utf8)
+library(stringr)
+library(tidytext)
+library(topicmodels)
+library(SnowballC)
+library(knitr)
+library(wordnet)
+library(doMC)
+library(foreach)
+library(gridExtra)
+registerDoMC(cores=30)
+setDict("/home/cfpb/bankerm/R/x86_64-redhat-linux-gnu-library/3.4/WordNet-3.0/dict")
+Sys.setenv(WNHOME = "/home/cfpb/bankerm/R/x86_64-redhat-linux-gnu-library/3.4/WordNet-3.0/")
+
+inWordnet <- function(w, pos =  c("ADJECTIVE", "ADVERB", "NOUN", "VERB")) {
+  for (x in pos) {
+     filter <- getTermFilter("ExactMatchFilter", w, TRUE)
+     terms <- getIndexTerms(x, 1, filter)
+     if (!is.null(terms)) return(TRUE)
+  }
+  return(FALSE)
+}
+
+# 
+# # Read in data
+setwd("~/Documents/personal/twitter")
+# tweets <- fread("tweets cleaned.csv")
+#tweets <- tweets %>% mutate(isReply = !is.na(replyToSN) & replyToSN != screenName) %>% as.data.table
+# tweets <- tweets %>% mutate(created = ymd_hms(created))
+
+filename <- list.files() %>% .[. %like% "alltweets"]
+
+# I have to specify variables to be read as characters because
+# of miscodings. Then, I will convert them to appropriate datatypes.
+# Specifying column classes and data size expedites reading it
+
+
+tweets <- fread(filename, verbose = T, skip = 2, header = T,
+                colClasses = Cs(character, integer, character, character,
+                                character, character, character,
+                                character, boolean, character,
+                                character, character, character,
+                                character, character, character, character,
+                                character, character),
+                nrow = 753804)
+emoji_dictionary <- fread("emoji_dictionary.csv") # Credit to Kate Lyons and Jessica Peterka-Bonetta for creating this dictionary
+backup <- tweets # So I don't have to read in data again
+
+tweets <- tweets %>% mutate(isReply = !is.na(replyToSN) & replyToSN != screenName) %>% as.data.table
+
+
+# Cast appropriate variables into numeric values
+colnames(tweets)[1:3] <- Cs(idx1, idx2, idx3)
+
+# tweets %>%
+#   mutate_at(Cs(idx1, idx3, favoriteCount,
+#                retweetCount, longitude, latitude),
+#             as.numeric) %>%
+#   mutate_at(Cs(favorited, truncated, isRetweet, retweeted),
+#             as.logical) %>%
+#   separate(created,
+#            into = c("date", "time"),
+#            sep = " ") %>%
+#   mutate(date = gsub("/", "-", date)) %>%
+#   separate(date,
+#            into = c("year", "month", "day"),
+#            sep = "-") %>%
+#   separate(time,
+#            into = c("hour", "minute", "second"),
+#            sep = ":") %>%
+
+cols <- Cs(idx1, idx3, favoriteCount, retweetCount, longitude, latitude)
+tweets[, (cols) := lapply(.SD, as.numeric), .SDcols = cols]
+
+# Cast appropriate variables into boolean values
+cols <- Cs(favorited, truncated, isRetweet, retweeted)
+tweets[, (cols) := lapply(.SD, as.logical), .SDcols = cols]
+
+tweets[, c("date", "time") := tstrsplit(created, split = " ")]
+tweets[, date := gsub("/", "-", date)]
+tweets[, c("year", "month", "day") := tstrsplit(date, split = "-")]
+tweets[, c("hour", "minute", "second") := tstrsplit(time, split = ":")]
+date_names <- Cs(year, month, day, hour, minute, second)
+# Rearrange values for m/d/y dating system
+# We can identify these tweets by seeing that 'seconds' is missing
+tweets[nchar(year) < 4, ":=" (year = paste0("20", day), month = year, day = month, second = "00")]
+# Recreate date and times with consistent format
+tweets[, ":=" (date = paste(year, month, day, sep = "-"),
+               time = paste(hour, minute, second, sep = ":"))]
+tweets[, created := paste(date, time)]
+
+# Classifying times and dates to access convenient functions
+created_formatted <- tweets[, ymd_hms(created)]
+date_formatted <- tweets[, ymd(date)]
+tweets[, created := created_formatted]
+tweets[, date := date_formatted]
+
+tweets <- tweets %>%
+  mutate_at(Cs(year, month, day, hour, minute, second),
+            as.numeric) %>%
+  as.data.table
+
+# Remove HTML tags from website links
+tweets[, website := gsub(pattern = '^<a .*">|</a>', "", statusSource)]
+# 
+# emoji_rows <- tweets[, which(!utf8_valid(text))]
+# tweets[emoji_rows, text := iconv(text, "latin1", "ASCII", "byte")]
+# sub <- tweets[emoji_rows, ]
+# 
+# emoji_dictionary[, Name := paste0(Name, " ")]
+# 
+# 
+# sub_emojis_replaced <- FindReplace(data = as.data.frame(sub), Var = "text", replaceData = as.data.frame(emoji_dictionary),
+#             from = "R_Encoding", to = "Name", exact = F)
+# 
+# tweets <- tweets[!emoji_rows]
+# tweets <- rbind(tweets, sub_emojis_replaced)
+# 
+# tweets[text %like% "<", text][1:10]
+# tweets[text %like% "<", .N]
+# 
+# 
+# tweets[text %like% "<e2><80><94>", text := gsub("<e2><80><94>", "—", text)]
+# tweets[text %like% "<e2><98><95>", text := gsub("<e2><98><95>", "HOT BEVERAGE ", text)]
+# tweets[text %like% "<e2><80><93>", text := gsub("<e2><80><93>", "—", text)]
+# tweets[text %like% "<e2><80><99>", text := gsub("<e2><80><99>", "'", text)]
+# tweets[text %like% "<c3><a8>", text := gsub("<c3><a8>", "e", text)]
+# tweets[text %like% "<e2><80><9c>", text := gsub("<e2><80><9c>", '"', text)]
+# tweets[text %like% "<e2><80><a6>", text := gsub("<e2><80><a6>", '...', text)]
+# tweets[text %like% "<e2><80><9d>", text := gsub("<e2><80><9d>", '"', text)]
+# tweets[text %like% "<c2><a0>", text := gsub("<c2><a0>", ' ', text)]
+
+tweets[text %like% "<", text := gsub("(<..>)", "", text)]
+#
+
+```
+
+## Exploratory Analysis
+
+Next, we want to familiarize ourselves with how our data look.
+
+We see that we have about 750k observations (individual tweets), and 28 variables.
+
+Looking at  individual columns, there are a few interesting variables. The richest variable is `text`, which contains the actual text of the tweets. Then we have the Twitter handle that authored the tweet, the account the tweet is replying to, metrics like favorites and retweets, and administrative variables like time and location of the tweet's origination. All other variables are either superfluous or not useful.
+
+```{r}
+glimpse(tweets) # Datatypes and example values of columns
+```
+
+The following is a tabulation of the number of unique variables each variables takes. We see that there are 115 unique companies. Additionally, all the date and time variables are correctly coded. It's unclear what `idx2` and `idx3` are supposed to represent. The boolean variables `favorited` and `retweeted` are incorrectly coded. Assumedly, we only have non-retweets in our sample because there is a single unique value for `isRetweet`.
+
+```{r}
+# Number of unique values in each column
+tweets %>% summarise_all(function(x) length(unique(x)))
+```
+
+We also want to see the shape of the distributions of our continuous variables. Both favorites and retweets are extremely right skewed, which is to be expected. After log transforming both variables along with log transforming y-axes, there is a quasi-linear relationship as each variables increases and observed frequencies. We split tweets by whether they are a reply or not, because replies are not visible on Twitter feeds to followers.
+
+```{r}
+tweets %>%
+  mutate(isReply = factor(isReply, labels = c("Not a reply", "Reply to tweet"))) %>%
+ggplot(., aes(x = log(favoriteCount + 1), fill = isReply)) +
+  geom_histogram() +
+  facet_wrap(~isReply, ncol = 2, scales = "free") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(x = "Number of Log Favorites", y = "Number of Tweets Observed") +
+  guides(fill = F)
+
+tweets %>%
+  mutate(isReply = factor(isReply, labels = c("Not a reply", "Reply to tweet"))) %>%
+ggplot(., aes(x = log(retweetCount + 1), fill = isReply)) +
+  geom_histogram() +
+  facet_wrap(~isReply, ncol = 2, scales = "free") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(x = "Number of Log Retweets", y = "Number of Tweets Observed") +
+  guides(fill = F)
+```
+
+Looking at the frequency of tweets over time, there seems to be an interesting spike in tweet frequency at the beginning of 2017. There isn't a clear explanation for this observation, especially since there aren't any spikes as similar times during other years. Otherwise, the distribution is expectedly left-skewed as companies increase social media interactions over time.
+
+The second graph shows a distribution of tweet frequencies over time by individual companies. There are stark differences in behavior. Some companies maintain high frequency of tweets, while other keep low frequencies of tweets. Other companies gradually increase tweeting, while another group tweets less predictably and tweets with high frequency every so often.
+
+```{r}
+ggplot(tweets, aes(x = created)) +
+  geom_histogram(position = "identity", bins = 100) +
+  theme_minimal() +
+  labs(x = "Date", y = "Number of Tweets")
+
+# Choose subset of 25 random companies to plot tweet frequency over time
+ggplot(tweets %>% filter(screenName %in% sample(unique(screenName), 25)),
+       aes(x = created)) +
+  geom_histogram(position = "identity", bins = 30) +
+  facet_wrap(~ screenName, nrow = 5, ncol = 5) +
+  theme_minimal() +
+  labs(x = "Date", y = "Number of Tweets")
+  
+```
+
+As for locational data, most companies don't disclose their location when tweeting. We only find 26 observations that have a location, which makes the data useless.
+
+```{r}
+# Most tweets don't disclose location
+tweets %>%
+  filter(!is.na(longitude)) %>%
+  group_by(screenName) %>%
+  summarise(locationTweets = n()) %>%
+  kable
+```
+
+Our dataset also provides the platform source of the screenName's tweet. David Robinson did a [very interesting text analysis](http://varianceexplained.org/r/trump-tweets/) demonstrating why a tweet's source can be informative. There are a large variety of platforms used, but a large proportion use third-party platforms like Sprinklr, Lithium, Radian6, or Spredfast to manage general customer experience across social media sites.
+
+```{r}
+# Where software are companies using to tweet in general?
+tweets %>%
+  group_by(website) %>%
+  summarise(source = n()) %>%
+  arrange(desc(source)) %>%
+  filter(utf8_valid(website)) %>%
+  slice(1:20) %>%
+  kable
+```
+
+We find each company's most frequently used method of tweeting. As a note, it might be interesting to look for differences in Twitter usage based on what platform the company uses to write tweets.
+
+```{r}
+
+# From what device/softwares does each specific screenName tweet?
+tweets %>%
+  group_by(website, screenName) %>%
+  summarise(source = n()) %>%
+  ungroup() %>%
+  group_by(screenName) %>%
+  mutate(sourcePercent = source/sum(source)) %>%
+  filter(sourcePercent == max(sourcePercent)) %>%
+  arrange(desc(sourcePercent)) %>%
+  slice(1:50) %>%
+  kable
+  
+```  
+
+Now, we look at engagement on tweets through the number of favorites and retweets. Companies involved in entertainment and media like Netflix, ESPN, Disney, and Rockstar Games, which are especially popular with Twitter's younger demographic, receive more favorites and retweets on average. Interestingly, Nike receives a lot of engagement with its tweets, likely because of how infrequently the screenName tweets, and how it markets with major sports icons.
+
+```{r}
+# Most engagement on non-reply tweets
+tweets %>%
+  filter(!isReply) %>%
+  group_by(screenName) %>%
+  summarise(rts = mean(retweetCount), favs = mean(favoriteCount), tweets = n()) %>%
+  arrange(desc(rts), desc(favs)) %>%
+  slice(1:30) %>%
+  kable
+
+tweets %>%
+  filter(isReply) %>%
+  group_by(screenName) %>%
+  summarise(rts = mean(retweetCount), favs = mean(favoriteCount), tweets = n()) %>%
+  arrange(desc(rts), desc(favs)) %>%
+  slice(1:30) %>%
+  kable
+```
+
+We also look at companies that most frequently send reply tweets as a percentage of all tweets. Airline companies like Delta and Southwest use most of their tweets to engage with and manage customers. There doesn't seem to be a pattern among companies that have a reply rate, there is a mix of industries and screenName size.
+
+```{r}
+# Which companies are most frequently making replies (i.e. personal engagement)?
+tweets %>%
+  group_by(screenName) %>%
+  summarise(reply_rate = sum(!is.na(replyToSN) & replyToSN != screenName)/n(), total_replies = sum(!is.na(replyToSN) & replyToSN != screenName)) %>%
+  arrange(desc(reply_rate)) %>%
+  slice(1:30) %>%
+  kable
+
+```
+
+## Sentiment Analysis
+
+### NRC Dictionary
+
+We can use word choices to classify whether a tweet or screenName exhibit specific sentiments. We start our sentiment analysis using the NRC dictionary. It has a larger dictionary of words and can classify numerous sentiments. Stopping/filler words like "and", "of", "to", etc. are removed.
+
+In general, companies post tweets with positive sentiments and to a lesser extent, more trustworthy, anticipatory, and joyous tweets. Here is table of total counts of sentiments across all observed tweets.
+
+As a side note, I looked into removing non-English words from the dataset to increase algorithm efficiency and eliminate noise from misspellings, but found existing functions too slow or their dictionaries to be too small. In any case, companies mostly use properly spelled words. 
+
+```{r sentiment-analysis}
+# replace_reg <- "https://t.co/[A-Za-z\\d]+|http://[A-Za-z\\d]+|&amp;|&lt;|&gt;|RT|https"
+# unnest_reg <- "([^A-Za-z_\\d#@']|'(?![A-Za-z_\\d#@]))"
+# tidy_tweets <- tweets %>%
+#   filter(!str_detect(text, "^RT")) %>%
+#   mutate(text = str_replace_all(text, replace_reg, "")) %>%
+#   unnest_tokens(word, text, token = "regex", pattern = unnest_reg) %>%
+#   filter(!word %in% stop_words$word,
+#          str_detect(word, "[a-z]"))
+# tidy_tweets <- tidy_tweets %>% filter(!str_detect(word, "^@")) %>% as.data.table
+# tidy_tweets[word %like% "@", word := "company-email"]
+
+tidy_tweets <- fread("tweets tokenized.csv")
+tidy_tweets <- tidy_tweets %>% mutate(created = ymd_hms(created))
+
+# USing NRC sentiments because it has a larger dictionary and more sentiments to classify
+sentiments <- tidy_tweets %>%
+  group_by(idx1, word) %>%
+  summarise(count = n()) %>%
+  inner_join(tweets %>%
+               select(idx1, screenName, created, isReply), by = "idx1") %>%
+  inner_join(get_sentiments("nrc"), by = c("word"))
+
+# Total counts of sentiments expressed
+sentiments %>%
+  group_by(sentiment, isReply) %>%
+  summarise(total = sum(count)) %>%
+  arrange(isReply, desc(total)) %>%
+  mutate(isReply = ifelse(isReply, "Reply", "Not a reply")) %>%
+  ggplot(aes(x = reorder(sentiment, -total), y = total, fill = isReply)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ isReply) +
+  theme_minimal() +
+  labs(x = "Sentiment", y = "Number of Observed Words") +
+  guides(fill = F)
+```
+
+We calculate the proportion of each sentiment that the company expresses as a part of all sentiments, then order each company within each sentiment. So, we find companies representative of each emotion. For example, we find Boeing at the top of the list for "anticipation", likely because many of their tweets acknowledge the anticipation of flights. Fox News is near the top of anger, disgust, negative, and sadness largely because news stories include such feelings. BBVA is mistakenly at the top of anger/disgust/negative because many of the company's tweets are in Spanish, and the word "sin" is classified as all of those sentiments, when the word actually translates to "without" in English. Also, "saber" and "leer" are considered negative words when they mean "to know" and "to learn", respectively.
+
+```{r}
+# Total count of sentiments by screenName
+sentiments %>%
+  group_by(sentiment, screenName) %>%
+  summarise(total = sum(count)) %>%
+  ungroup() %>%
+  group_by(screenName) %>%
+  mutate(total = total/sum(total, na.rm = T)) %>%
+  spread(sentiment, total) -> screenName_sentiments
+
+output <- tibble(test = 1:length(unique(sentiments$screenName)))
+
+for (col in names(screenName_sentiments)[-1]){
+  output[[col]] <-
+  screenName_sentiments %>%
+    arrange_(paste0("desc(", col, ")")) %>%
+    .$screenName
+}
+
+output %>%
+  slice(1:30) %>%
+  kable
+```  
+
+Next, we look at common words by each sentiment for non-replies. We expect non-replies to be more indicative of general announcements and marketing.
+
+```{r}
+# Most common words by sentiment
+top_n_words <- 9 # Number of most common words
+
+sentiments %>%
+  filter(isReply == F) %>%
+  group_by(sentiment) %>%
+  count(word, sort = T) %>%
+  filter(n >= sort(n,partial=n()-top_n_words)[n()-top_n_words]) %>%
+  select(sentiment, word) %>%
+  arrange(sentiment) %>%
+  mutate(idx = rep(1:(top_n_words+1), n()/top_n_words)) %>%
+  spread(sentiment, word) %>%
+  select(-idx) %>%
+  kable
+```
+
+In contrast, we look at words used in replies, which are typically aimed at customers and complaints. Many of the generally negative words are suggestive of being understanding towards frustrated customers.
+
+```{r}
+# Most common words by sentiment
+top_n_words <- 9 # Number of most common words
+
+sentiments %>%
+  filter(isReply == T) %>%
+  group_by(sentiment) %>%
+  count(word, sort = T) %>%
+  filter(n >= sort(n,partial=n()-top_n_words)[n()-top_n_words]) %>%
+  select(sentiment, word) %>%
+  arrange(sentiment) %>%
+  mutate(idx = rep(1:(top_n_words+1), n()/top_n_words)) %>%
+  spread(sentiment, word) %>%
+  select(-idx) %>%
+  kable
+```
+
+#### Clustering companies by sentiment
+
+Perhaps we can find natural clusters of companies based on the proportion of emotions they use in their tweets. We use k-means clustering, and using the Elbow method, we settle on 3 clusters.
+
+The clusters seem to form into companies that
+    * Use positive words more than average
+    * Use negative words more than average
+    * Don't particularly use positive or negative words
+
+From how clearly defined the boundaries of the clusters are in the visualization, we can conclude that specific sentiments like anger, disgust, trust, etc. are not very distinguishable from the more general positive and negative sentiments.
+
+```{r}
+
+screenName_sentiments <- screenName_sentiments %>% 
+  ungroup %>% 
+  filter(screenName != "Costco") %>%
+  replace_na(list(anger = 0, anticipation = 0, disgust = 0, fear = 0, joy = 0,
+                  negative = 0, positive = 0, sadness = 0, surprise = 0, trust = 0))
+
+
+
+set.seed(20)
+fit_cluster <- function(k){
+  fit <- kmeans(screenName_sentiments %>% select(-screenName) %>% as.matrix, k, nstart = 20)
+  return(fit$betweenss/fit$totss)
+}
+
+clusters <- data.table(k = 1:20)
+clusters$ratio <- sapply(clusters$k, fit_cluster)
+ggplot(clusters, aes(x = k, y = ratio)) +
+  geom_line() +
+  scale_x_continuous(breaks = pretty(clusters$k, n = 20)) +
+  labs(x = "Number of clusters", y = "Proportion of Variance Explained")
+
+fit <- kmeans(screenName_sentiments %>% select(-screenName) %>% as.matrix, 3, nstart = 20)
+screenName_sentiments <- screenName_sentiments %>% mutate(cluster = as.factor(fit$cluster))
+
+ggplot() +
+  geom_point(data = screenName_sentiments, aes(x = negative, y = positive, 
+                                  color = cluster)) +
+  geom_label(data = screenName_sentiments %>% 
+               filter(positive > 0.4 | negative > 0.12 | (positive < 0.3 & negative < 0.04)),
+             aes(x = negative, y = positive, label = screenName), nudge_y = 0.02) +
+  labs(x = "Percentage of Negative Sentiments", y = "Percentage of Positive Sentiments") +
+  guides(color = F) +
+  theme_minimal()
+```
+
+### Bing Dictionary
+
+The NRC dictionary doesn't seem large enough to fit so many emotions, and we find too much overlap within positive and negative emotions. So, we change our sentiment dictionary to the Bing dictionary, which classifies words as simply positive or negative. As a result, we can find a net sentiment rating by taking the difference in frequencies of positive and negative words.
+
+Sentiment scores are mainly a function of frequency of tweeting, so we plot the two variables against each other. We notice that Starbucks, McDonald's, T-Mobile, Xbox, Walmart, and LEGO are all examples of brands that use more positive words than expected. On the other hand, airlines like Southwest and Delta have a lower sentiment score than a linear model predicts. Additionally, Google and Fox News have noticeably smaller sentiment scores for how often they tweet. Fox News is the only brand to have a negative sentiment score.
+
+```{r}
+# Changing sentiment dictionary to Bing to calculate a unidimensional sentiment score
+bing <- tidy_tweets %>%
+  select(idx1, word, screenName = screenName, created) %>%
+  inner_join(get_sentiments("bing"), by = c("word")) %>%
+  group_by(screenName) %>%
+  count(sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative) %>%
+  arrange(desc(sentiment))
+
+bing <- left_join(bing, tweets %>%
+                    group_by(screenName) %>%
+                    summarise(total = n()),
+                  by = "screenName")
+
+ggplot() +
+  geom_point(data = bing, aes(x = total, y = sentiment)) +
+  geom_smooth(data = bing, aes(x = total, y = sentiment), se = F, method = "lm") +
+  geom_label(data = bing %>% filter(sentiment < -1000 || total > 15000),
+             aes(x = total, y = sentiment, label = screenName), nudge_y = 1000) +
+  theme_minimal() +
+  labs(x = "Total Tweets", y = "Sentiment Score")
+
+```
+
+We look at the most frequently used words by each company. Costco received a lot of backlash over its logo being on Breitbart News, and replied to users assuring that it is not affiliated with Breitbart News. Companies like Disney, Subway, Visa, and others frequently promote a hashtag for their marketing campaign. Other companies like Ford or Verizon focus on customer relations, and direct people to (direct) message the company through Twitter or customer service.
+
+```{r}
+# Most frequently used word by screenName
+frequency <- tidy_tweets %>% 
+  group_by(screenName) %>% 
+  count(word, sort = TRUE) %>% 
+  left_join(tidy_tweets %>% 
+              group_by(screenName) %>% 
+              summarise(total = n())) %>%
+  mutate(freq = n/total)
+
+frequency %>%
+  group_by(screenName) %>%
+  filter(freq == max(freq)) %>%
+  ungroup() %>%
+  arrange(desc(freq)) %>%
+  kable
+```
+
+We look at a table of the most frequently used words in replies and non-replies. 
+
+As expected, non-replies use words marketing the company's products, such as "collection" for a collection of items or clothes, "watch" for promotional videos, "time" in anticipation for upcoming product releases, and so on.
+
+Replies include words indicative of customer management, using words like "happy" or "love" to show eagerness, and words like "sharing" or "hear" to acknowledge and engage with brand loyalists.
+
+```{r}
+# Most frequently used words in non-replies
+tidy_tweets %>%
+  filter(isReply == F) %>%
+  count(word, sort = T) %>%
+  filter(n > 150) %>%
+  mutate(NonReplyWord = reorder(word, n)) %>%
+  select(NonReplyWord) %>%
+  slice(1:30) -> nonreplywords
+
+# Most frequently used words in replies
+tidy_tweets %>%
+  filter(isReply == T) %>%
+  count(word, sort = T) %>%
+  filter(n > 150) %>%
+  mutate(ReplyWord = reorder(word, n)) %>%
+  select(ReplyWord) %>%
+  slice(1:30) -> replywords
+
+cbind(nonreplywords, replywords) %>% kable
+```
+
+## Topic Modeling
+
+### Word Ratios
+
+If we're creating topic models, we would expect natural topics to arise between replies and non-replies. We can first look at log ratios of word frequencies between replies and non-replies to identify words that are distinctive of replies and non-replies.
+
+```{r}
+word_ratios <- tidy_tweets %>%
+  mutate(isReply = ifelse(isReply, "reply", "no_reply")) %>%
+  count(word, isReply) %>%
+  filter(n >= 50) %>%
+  ungroup %>%
+  spread(isReply, n, fill = 0) %>%
+  mutate_if(is.numeric, funs((. + 1) / sum(. + 1))) %>%
+  mutate(logratio = log(reply/no_reply)) %>%
+  arrange(desc(logratio))
+
+word_ratios %>%
+  arrange(abs(logratio))
+
+word_ratios %>%
+  group_by(logratio < 0) %>%
+  top_n(15, abs(logratio)) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = T) +
+  coord_flip() +
+  theme_minimal() +
+  labs(x = "Word",y = "Log odds ratio (Reply/Not a reply)") +
+  scale_fill_discrete(name = "", labels = c("Reply", "Not a reply"))
+```
+
+### LDA (Latent Dirichlet allocation)
+
+I tried modeling a Latent Dirichlet allocation (LDA) with 2, 3, and 4 topics. However, there didn't seem to be a distinct separation of tweets - I was expecting a clearer line between sales, customer service, and possibly general announcements. With such a large dataset, it is more common to use a larger number of topics. Unfortunately, we don't have computational power to fit that many topics. Stemming words helps efficiency somewhat, but modelling more than 4 topics still takes a long time. 
+
+The reason we're interested in topics in the first place is to find a natural clustering of what companies tweet. We can get a better understanding of how social media is used by companies, and how companies communicate with consumers in general.
+
+```{r LDA-analysis}
+# tidy_tweets_stemmed <- tidy_tweets %>% 
+#   mutate(word = wordStem(word)) %>% 
+#   group_by(idx1, word) %>%
+#   summarise(n = n()) %>%
+#   as.data.table
+# 
+# tidy_tweets_stemmed <- left_join(tidy_tweets_stemmed, tweets %>% 
+#                     select(idx1, isReply, created, favoriteCount, retweetCount, screenName))
+
+tidy_tweets_stemmed <- fread("stemmed tidy tweets.csv")
+tidy_tweets_stemmed[, created := ymd_hms(created)]
+
+LDAtweets <- LDA(tidy_tweets_stemmed %>%
+                   cast_dtm(term = word, document = idx1, value = n), k = 4, control = list(seed = 1234))
+
+tweet_topics <- LDAtweets %>%
+  tidy(matrix = "beta")
+
+tweet_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  arrange(beta) %>%
+  ungroup() -> dt
+
+plots <- list()
+for (t in unique(dt$topic)){
+    g <- ggplot(dt %>% filter(topic == t), aes(x = reorder(term, beta), y = beta)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(x = ifelse(t == 1, "Stemmed Word", ""), y = "Beta") +
+      theme_minimal()
+    
+    plots[[t]] <- g
+}
+    
+  do.call(function(...) grid.arrange(..., ncol = length(plots)), plots)
+```
+
+Let's focus on just non-replies so that we can ignore many of the common words used in customer service, to improve efficiency, and to form topics specifically on how companies market to consumers. We remove tweets from bbva because we find that many of the common words from Spanish are muddling results.
+
+There isn't a great statistical method for choosing and evaluating the number of topics in the model. We settle on 3 topics because each topic has a similar distribution of beta values.
+
+Unfortunately, the topics are very similar and have a lot of word overlap. I don't see broad similaries between words within each topic.
+
+```{r}
+# tidy_tweets_summ <- tidy_tweets %>%
+#   group_by(idx1, word) %>%
+#   summarise(n = n()) %>%
+#   as.data.table
+# 
+# tidy_tweets_summ <- left_join(tidy_tweets_summ, tweets %>%
+#                     select(idx1, isReply, created, favoriteCount, retweetCount, screenName))
+
+tidy_tweets_summ <- fread("tidy tweets summary.csv")
+tidy_tweets_summ[, created := ymd_hms(created)]
+
+LDAtweets <- LDA(tidy_tweets_summ %>%
+                   filter(isReply == F & screenName != "bbva") %>%
+                   cast_dtm(term = word, document = idx1, value = n), k = 3, control = list(seed = 1234))
+
+tweet_topics <- LDAtweets %>%
+  tidy(matrix = "beta")
+
+tweet_topics %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  arrange(beta) %>%
+  ungroup() -> dt
+
+plots <- list()
+for (t in unique(dt$topic)){
+    g <- ggplot(dt %>% filter(topic == t), aes(x = reorder(term, beta), y = beta)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(x = ifelse(t == 1, "Stemmed Word", ""), y = "Beta") +
+      theme_minimal()
+    
+    plots[[t]] <- g
+}
+    
+  do.call(function(...) grid.arrange(..., ncol = length(plots)), plots)
+  
+```
+
+## Linear Modelling
+
+We can try to find covariates that correspond to more popular tweets, using either favorites or retweets as an outcome measure. Specifically, we're interested in whether using positive or negative words can influence the popularity of a tweet, whether by using stronger words or by tapping an emotional appeal. We remove replies because they aren't given as much exposure as regular tweets.
+
+From a basic plot of sentiment score against retweets, it seems that using negative words can increase the number of retweets.
+
+```{r}
+bing <- tidy_tweets %>%
+  select(idx1, word, screenName, created) %>%
+  inner_join(get_sentiments("bing"), by = c("word")) %>%
+  group_by(idx1) %>%
+  count(sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative) %>%
+  arrange(desc(sentiment))
+
+all <- left_join(tweets, bing, by = "idx1") %>% as.data.table
+all[is.na(negative), negative := 0]
+all[is.na(positive), positive := 0]
+all[, sentiment := positive - negative]
+
+all <- all %>% filter(isReply == F) %>% as.data.table
+
+ggplot(all, aes(x = sentiment, y = log(retweetCount + 1))) +
+  geom_smooth() +
+  labs(x = "Sentiment Score", y = "Log Retweets")
+
+all[, ":=" (logRTs = log(retweetCount + 1), logFavs = log(favoriteCount + 1)) ]
+```
+
+Positive and negative word frequencies are not normally distributed and very few values. We will subset our dataset to only include tweets with 4 or less positive words, and 3 or less negative words because higher values have larger variance and leverage, which would make our estimates unstable. We also use both variables as categorical variables to circumvent assumptions of normality.
+
+We also remove tweets by BBVA to reduce noise from Spanish tweets.
+
+```{r}
+all[, table(positive)]
+all[, table(negative)]
+
+all <- all[positive <= 4 & negative <= 3]
+all[, ":=" (positive = as.factor(positive), negative = as.factor(negative))]
+all <- all[screenName != "bbva"]
+```
+
+
+We also find a correlation coefficient of `r round(all[, cor(logRTs, logFavs, use = "complete.obs")], 2)` between log retweets and favorites, so we don't expect too much of a difference when using them as outcome measures. It also wouldn't make sense to use either as a covariate because they're both measuring the same construct - how "large" a tweet is.
+
+We fit a linear regression model with log retweets as a response variable. We include covariates for the number of positive words used (`positive`), the number of negative words used (` negative`), and their interaction (`positive:negative`). We also included company and monthly time fixed effects to control for company popularity and the overall popularity of Twitter over time.
+
+In general, it seems that positive and negative words increase a tweet's popularity. All of the estimates for positive words are positive, and the values of coefficients increase as the number of positive words increases. The model predicts tweets with two positive words are more popular than tweets with one positive word, and the same goes for 3 vs. 2 words. Interestingly, a single negative word is no different from a tweet without any positive or negative words. But greater numbers of negative words are related to more popular tweets (although our sample is too small for tweets with three negative words).
+
+Additionally, the interactions between positive and negative words also produce generally positive estimates (save for a few terms without explanatory power). That means that adding positive or negative words will tend to give you more popular tweets in general.
+
+To interpret coefficients explicitly, our model predicat that going from no emotional words to a single positive word in a tweet would give a 1.8% increase in retweets. Going from no emotional words to two positive words would give a 5.2% increase in retweets.
+
+The model had an adjusted R2 of 0.6655 (not shown). That is surprisingly large, but it mostly due to the model's fixed effects.
+
+```{r}
+# Summary function that allows selection of which coefficients to include 
+# in the coefficient table
+# Works with summary.lm and summary.plm objects
+my.summary = function(x, rows, digits=3) {
+
+  # Print a few summary elements that are common to both lm and plm model summary objects
+  cat("Call\n")
+  print(x$call)
+  cat("\nResiduals\n")
+  print(summary(x$residuals))
+  cat("\n")
+  print(coef(x)[rows,])
+
+  # Print elements unique to lm model summary objects
+  if("summary.lm" %in% class(x)) {
+    cat("\nResidual standard error:", round(x$sigma,3), "on", x$df[2], "degrees of freedom")
+    cat(paste(c("\nF-statistic:", " on"," and"), round(x$fstatistic,2), collapse=""),
+        "DF, p-value:",
+        format.pval(pf(x$fstatistic[1L], x$fstatistic[2L], x$fstatistic[3L], 
+                       lower.tail = FALSE), digits=digits))
+
+  # Print elements unique to plm model summary objects  
+  } else if ("summary.plm" %in% class(x)) {
+    cat(paste("\nResidual Sum of Squares: ", signif(deviance(x), 
+                                                  digits), "\n", sep = ""))
+    fstat <- x$fstatistic
+    if (names(fstat$statistic) == "F") {
+      cat(paste("F-statistic: ", signif(fstat$statistic), " on ", 
+                fstat$parameter["df1"], " and ", fstat$parameter["df2"], 
+                " DF, p-value: ", format.pval(fstat$p.value, digits = digits), 
+                "\n", sep = ""))
+    }
+    else {
+      cat(paste("Chisq: ", signif(fstat$statistic), " on ", 
+                fstat$parameter, " DF, p-value: ", format.pval(fstat$p.value, 
+                                                               digits = digits), "\n", sep = ""))
+    }
+  }
+}
+
+fit <- lm(logRTs ~ positive*negative + 
+            screenName + 
+            as.factor(year)*as.factor(month), data = all)
+
+summary(fit) %>% my.summary(rows = grep("positive|negative", names(coef(fit))))
+
+```
+
+We check for consistent effects by running the same linear regression except using log favorites as our response variable.
+
+Despite retweets and favorites being highly correlated, we find very different effects. We see that including positive words tends to increase favorites. While our coefficients are larger, tweets tend to have more favorites, so we can't compare effect sizes. However, including negative words tends to DECREASE the tweet's number of favorites. Interaction terms suggest that favorites tend to increase by a small amount from increasing the number of emotional words.
+
+The model predicts that going from a tweet with no emotional words to one positive word would increase favorites by 4.9%. The model also predicts that adding a negative word to a tweet with no emotional words would decrease favorites by 4.0%.
+
+```{r}
+fit <- lm(logFavs ~ positive + negative + positive:negative + screenName + as.factor(year)*as.factor(month), data = all)
+
+summary(fit) %>% my.summary(rows = grep("positive|negative", names(coef(fit))))
+```
+
+
